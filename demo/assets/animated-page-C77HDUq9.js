@@ -1,0 +1,1 @@
+import{di as e,mi as t,ri as n}from"./index-CzT2OOGB.js";e();var r=t(n(),1);const i=({children:e,className:t})=>(0,r.jsx)(`div`,{className:t,children:e}),a=({children:e,className:t,as:n=`div`})=>(0,r.jsx)(n,{className:t,children:e}),o=({children:e,className:t,as:n=`div`})=>(0,r.jsx)(n,{className:t,children:e});export{o as n,a as r,i as t};
