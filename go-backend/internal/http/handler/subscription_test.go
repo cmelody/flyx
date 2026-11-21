@@ -1,14 +1,266 @@
 package handler
 
 import (
+	"bytes"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"go-backend/internal/http/response"
+	"go-backend/internal/kernel"
 	"go-backend/internal/store/model"
 	"go-backend/internal/store/repo"
 )
+
+func TestSS2022InboundKeyOnEditAndModeChange(t *testing.T) {
+	repository, err := repo.Open(t.TempDir() + "/ss2022-edit.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = repository.Close() })
+	h := New(repository, "unit-test-secret")
+	nodeID := seedRelayTargetNode(t, repository, "ss-node", "203.0.113.1")
+	xray := seedChainKernel(t, repository, nodeID, kernel.TypeXray)
+	sharedKey := kernel.ShadowsocksPassword(kernel.DefaultSSMethod)
+	row := seedChainInbound(t, repository, xray, "ss2022", kernel.Inbound{
+		Protocol: kernel.ProtocolShadowsocks, Port: 8388, Settings: kernel.Settings{Method: kernel.DefaultSSMethod, Password: sharedKey},
+	}, 0)
+	update := func(metered bool, password string) string {
+		t.Helper()
+		payload, err := json.Marshal(inboundRequest{
+			ID: row.ID, Name: row.Name, Protocol: row.Protocol, Port: row.Port,
+			Settings: kernel.Settings{Method: kernel.DefaultSSMethod, Password: password, SSSubscriptionUsers: metered},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		result := httptest.NewRecorder()
+		h.inboundUpdate(result, httptest.NewRequest(http.MethodPost, "/api/v1/inbound/update", bytes.NewReader(payload)))
+		var reply response.R
+		if err := json.Unmarshal(result.Body.Bytes(), &reply); err != nil || reply.Code != 0 {
+			t.Fatalf("edit failed: %s, %v", reply.Msg, err)
+		}
+		stored, err := repository.GetNodeInbound(row.ID)
+		if err != nil || stored == nil {
+			t.Fatalf("read saved inbound: %v", err)
+		}
+		inbound, err := inboundFromModel(*stored)
+		if err != nil || inbound.Settings.SSSubscriptionUsers != metered || inbound.Settings.Password == "" {
+			t.Fatalf("invalid saved credentials: %v", err)
+		}
+		return inbound.Settings.Password
+	}
+	serverKey := update(true, sharedKey)
+	if serverKey == sharedKey || update(true, "") != serverKey {
+		t.Fatal("enabling must rotate the old shared key, but subsequent edits must keep it stable")
+	}
+	if update(false, serverKey) == serverKey {
+		t.Fatal("disabling must not let the old server key become a usable shared password")
+	}
+}
+
+func TestSSSubscriptionsSharePortAndRevokeOnlyOverQuotaUser(t *testing.T) {
+	for _, method := range []string{"aes-128-gcm", "2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm"} {
+		t.Run(method, func(t *testing.T) { testSSSubscriptionPort(t, method) })
+	}
+}
+
+func testSSSubscriptionPort(t *testing.T, method string) {
+	t.Helper()
+	repository, err := repo.Open(t.TempDir() + "/subscription-ss.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = repository.Close() })
+	h := New(repository, "unit-test-secret")
+	nodeID := seedRelayTargetNode(t, repository, "ss-node", "203.0.113.1")
+	xray := seedChainKernel(t, repository, nodeID, kernel.TypeXray)
+	inbound := seedChainInbound(t, repository, xray, "metered-ss", kernel.Inbound{
+		Protocol: kernel.ProtocolShadowsocks, Port: 8388,
+		Settings: kernel.Settings{Method: method, SSSubscriptionUsers: true},
+	}, 0)
+	stored, err := inboundFromModel(*inbound)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UnixMilli()
+	first := model.Subscription{Name: "first", Kind: model.SubscriptionShare, Token: strings.Repeat("a", 32),
+		Password: "first-password", SourceAll: 1, Enabled: 1, TrafficLimit: 1000, CreatedTime: now, UpdatedTime: now}
+	second := model.Subscription{Name: "second", Kind: model.SubscriptionShare, Token: strings.Repeat("b", 32),
+		Password: "second-password", SourceAll: 1, Enabled: 1, CreatedTime: now, UpdatedTime: now}
+	group := model.NodeGroup{Name: "shared-ss", SourceAll: 1, CreatedTime: now, UpdatedTime: now}
+	if err := repository.SaveNodeGroup(&group); err != nil {
+		t.Fatal(err)
+	}
+	for _, sub := range []*model.Subscription{&first, &second} {
+		sub.GroupIDs = repo.FormatGroupIDs([]int64{group.ID})
+		if err := repository.SaveSubscription(sub); err != nil {
+			t.Fatal(err)
+		}
+	}
+	context, err := h.loadSubContext()
+	if err != nil {
+		t.Fatal(err)
+	}
+	draft := &model.Subscription{GroupIDs: first.GroupIDs}
+	if endpoints := h.subNodes(context, draft); len(endpoints) != 1 || endpoints[0].OrderKey == "" {
+		t.Fatal("the metered SS node must appear in the subscription preview")
+	}
+	passwords := make(map[int64]string, 2)
+	for _, sub := range []*model.Subscription{&first, &second} {
+		endpoints := h.subNodes(context, sub)
+		if len(endpoints) != 1 || endpoints[0].Port != inbound.Port {
+			t.Fatalf("subscription %d did not get the shared port", sub.ID)
+		}
+		password := endpoints[0].Inbound.Settings.Password
+		uri, ok := kernel.ShareURI(endpoints[0])
+		if !ok || !strings.HasPrefix(uri, "ss://") {
+			t.Fatalf("subscription %d did not get a normal SS URI", sub.ID)
+		}
+		if kernel.SS2022KeyLen(method) > 0 {
+			parsed, err := url.Parse(uri)
+			if err != nil {
+				t.Fatal("SS2022 URI cannot be parsed")
+			}
+			linkPassword, _ := parsed.User.Password()
+			serverKey, userKey, combined := strings.Cut(password, ":")
+			if parsed.User.Username() != method || linkPassword != password || !combined || serverKey != stored.Settings.Password || userKey == "" || userKey == sub.Password {
+				t.Fatalf("subscription %d did not get the encoded server and user keys", sub.ID)
+			}
+			password = userKey
+		} else if password != sub.Password {
+			t.Fatalf("subscription %d did not get its legacy password", sub.ID)
+		}
+		passwords[sub.ID] = password
+	}
+	if endpoints, _ := h.inboundEndpoints([]model.NodeInbound{*inbound}); len(endpoints) != 0 {
+		t.Fatal("metered SS must not expose a shared endpoint")
+	}
+	if _, err := h.chainEndpoint(inbound, nodeID); err == nil {
+		t.Fatal("metered SS must not be used as a shared chain target")
+	}
+	config := func() string {
+		t.Helper()
+		payload, _, err := h.buildKernelApplyPayload(xray)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return payload["files"].([]kernel.File)[0].Content
+	}
+	if rendered := config(); passwords[first.ID] == passwords[second.ID] ||
+		!strings.Contains(rendered, passwords[first.ID]) || !strings.Contains(rendered, passwords[second.ID]) {
+		t.Fatal("both independent credentials must be configured")
+	}
+	h.applyUserCounters(nodeID, "epoch", []agentUserCounter{
+		{ID: first.ID, Dir: "down", Bytes: 1001}, {ID: second.ID, Dir: "down", Bytes: 100},
+	}, now)
+	for _, check := range []struct {
+		token string
+		info  string
+	}{
+		{first.Token, "upload=0; download=1001; total=1000; expire=0"},
+		{second.Token, "upload=0; download=100; total=0; expire=0"},
+	} {
+		export := httptest.NewRecorder()
+		h.openSubscription(export, httptest.NewRequest(http.MethodGet, "/api/v1/open_api/sub/"+check.token, nil))
+		if export.Code != http.StatusOK || export.Header().Get("Subscription-Userinfo") != check.info {
+			t.Fatalf("each subscription must export its own usage: %d %v", export.Code, export.Header())
+		}
+	}
+	if rendered := config(); strings.Contains(rendered, passwords[first.ID]) || !strings.Contains(rendered, passwords[second.ID]) {
+		t.Fatal("quota should revoke only the first password")
+	}
+	second.Enabled = 0
+	if err := repository.SaveSubscription(&second); err != nil {
+		t.Fatal(err)
+	}
+	defaultSub, err := repository.DefaultSubscription(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defaultSub.Enabled = 0
+	if err := repository.SaveSubscription(defaultSub); err != nil {
+		t.Fatal(err)
+	}
+	if rendered := config(); strings.Contains(rendered, `"protocol": "shadowsocks"`) {
+		t.Fatal("without active subscriptions, the SS port should not listen")
+	}
+}
+
+func TestSubscriptionPreviewOrderMatchesSavedExportAndDoesNotChangeGroup(t *testing.T) {
+	repository, err := repo.Open(t.TempDir() + "/subscription-order.db")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = repository.Close() })
+	h := New(repository, "unit-test-secret")
+	nodeID := seedRelayTargetNode(t, repository, "ordered-node", "203.0.113.1")
+	xray := seedChainKernel(t, repository, nodeID, kernel.TypeXray)
+	for index, name := range []string{"first", "second", "third"} {
+		seedChainInbound(t, repository, xray, name, kernel.Inbound{
+			Protocol: kernel.ProtocolShadowsocks, Port: 8388 + index, Settings: kernel.Settings{Method: "aes-128-gcm", Password: "owner"},
+		}, 0)
+	}
+	group := model.NodeGroup{Name: "sorted", SourceAll: 1, Options: `{"sort":"name"}`}
+	if err := repository.SaveNodeGroup(&group); err != nil {
+		t.Fatal(err)
+	}
+	preview := func(order []string) []subPreviewItem {
+		t.Helper()
+		payload, err := json.Marshal(subscriptionRequest{GroupIDs: []int64{group.ID}, Options: subPipeline{NodeOrder: order}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		response := httptest.NewRecorder()
+		h.subscriptionPreview(response, httptest.NewRequest(http.MethodPost, "/subscription/preview", strings.NewReader(string(payload))))
+		var result struct {
+			Code int
+			Data struct{ Items []subPreviewItem }
+		}
+		if err := json.Unmarshal(response.Body.Bytes(), &result); err != nil || result.Code != 0 || len(result.Data.Items) != 3 {
+			t.Fatalf("bad preview: %s (%v)", response.Body.String(), err)
+		}
+		return result.Data.Items
+	}
+	defaultItems := preview(nil)
+	order := []string{defaultItems[1].OrderKey, defaultItems[0].OrderKey}
+	sorted := preview(order)
+	if !slices.Equal([]string{sorted[0].Name, sorted[1].Name, sorted[2].Name}, []string{"second", "first", "third"}) {
+		t.Fatalf("preview order mismatch: %+v", sorted)
+	}
+	pipe := subPipeline{NodeOrder: order}
+	if err := pipe.normalize(); err != nil {
+		t.Fatal(err)
+	}
+	options, err := json.Marshal(pipe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	subscription := &model.Subscription{
+		Name: "ordered", Kind: model.SubscriptionShare, Password: "own", Token: strings.Repeat("a", 32),
+		GroupIDs: repo.FormatGroupIDs([]int64{group.ID}), Options: string(options), Enabled: 1,
+	}
+	if err := repository.SaveSubscription(subscription); err != nil {
+		t.Fatal(err)
+	}
+	export := httptest.NewRecorder()
+	h.openSubscription(export, httptest.NewRequest(http.MethodGet, "/api/v1/open_api/sub/"+subscription.Token+"?format=clash", nil))
+	body := export.Body.String()
+	second := strings.Index(body, `name: "second"`)
+	first := strings.Index(body, `name: "first"`)
+	third := strings.Index(body, `name: "third"`)
+	if export.Code != http.StatusOK || !(0 <= second && second < first && first < third) {
+		t.Fatalf("export order mismatch: %d\n%s", export.Code, body)
+	}
+	if after := preview(nil); !slices.Equal(after, defaultItems) {
+		t.Fatalf("saving the subscription must not reorder its node group: %+v", after)
+	}
+}
 
 func TestKernelPayloadCarriesActiveShareSubscriptions(t *testing.T) {
 	r, err := repo.Open(t.TempDir() + "/subscription.db")

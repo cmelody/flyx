@@ -142,13 +142,21 @@ export const unbindGithub = (password: string) =>
 export const createNode = (data: NodeMutationPayload) =>
   Network.post("/node/create", data);
 export const getNodeList = () => Network.post<NodeApiItem[]>("/node/list");
-/** Each node's traffic since the 1st of this month (viewer's time zone): id → [in, out]. */
+/** Each node's traffic in its current period (from its reset day, panel time zone), corrected: id → [in, out]. */
 export const getNodeMonthTraffic = () =>
   Network.post<Record<string, [number, number]>>("/node/traffic/month", {
     tzOffset: -new Date().getTimezoneOffset(),
   });
 export const getDashboardNodeExpiryList = () =>
   Network.post<NodeApiItem[]>("/node/list", {});
+/** Only a server's price and renewal (the 价格与到期 dialog). */
+export const updateNodeBilling = (data: {
+  id: number;
+  price: number;
+  currency: string;
+  renewalCycle: string;
+  expiryTime: number;
+}) => Network.post("/node/billing", data);
 export const updateNode = (data: NodeMutationPayload) =>
   Network.post("/node/update", data);
 /** Outcome of uninstalling the agent while deleting a server. */
@@ -473,16 +481,6 @@ export interface GistBackupVersion {
   version: string;
   committedAt: number;
 }
-export interface GithubTokenStatus {
-  set: boolean;
-  /** Not set here, but GITHUB_TOKEN is set for the panel. */
-  fromEnv: boolean;
-  repo: string;
-}
-export const getGithubTokenStatus = () =>
-  Network.post<GithubTokenStatus>("/config/github-token/status");
-export const saveGithubToken = (data: { token?: string; clear?: boolean }) =>
-  Network.post<null>("/config/github-token/save", data);
 export const getGistBackupStatus = () =>
   Network.post<GistBackupStatus>("/backup/gist/status");
 /** An empty token or password keeps the saved one. */
@@ -768,6 +766,7 @@ export interface SubPipeline {
   prefix: string;
   dedupe: boolean;
   sort: "" | "name";
+  nodeOrder?: string[];
   regionGroups: boolean;
   /** Client-side chain: names matching chainLanding dial through the relay group. */
   chainLanding: string;
@@ -974,6 +973,7 @@ export interface SubscriptionDraft {
   resetDay: number;
 }
 export interface SubPreviewItem {
+  orderKey?: string;
   name: string;
   original: string;
   region: string;
@@ -995,6 +995,8 @@ export const saveSubscription = (data: SubscriptionDraft) =>
   Network.post<SubscriptionItem>("/subscription/save", data);
 export const deleteSubscription = (id: number) =>
   Network.post("/subscription/delete", { id });
+export const orderSubscriptions = (ids: number[]) =>
+  Network.post("/subscription/order", { ids });
 export const resetSubscription = (id: number) =>
   Network.post<SubscriptionItem>("/subscription/reset", { id });
 /** A subscription as the user it is assigned to sees it. */
@@ -1083,6 +1085,7 @@ export const saveRemoteSource = (data: {
   relayOnly: boolean;
   enabled?: boolean;
   userAgent?: string;
+  nodeOrder?: number[];
 }) =>
   Network.post<
     RemoteSourceItem | { source: RemoteSourceItem; result: RemoteSyncResult }
@@ -1217,6 +1220,7 @@ export const updateInboundSplit = (data: {
   id: number;
   outboundId: number;
   splitRules: SplitRule[];
+  defaultBlock?: boolean;
   outboundIpStrategy?:
     | "auto"
     | "ipv4_only"
@@ -1311,6 +1315,17 @@ export interface PublicStatusNode {
   memTotal?: number;
   diskUsed?: number;
   diskTotal?: number;
+  /** The admin's group ("" or absent = none) and the public note. */
+  group?: string;
+  note?: string;
+  /** Price per cycle ("month", "quarter", "year", "6m", "2y"), when shown. */
+  price?: number;
+  currency?: string;
+  cycle?: string;
+  /** Monthly traffic quota and what counts against it, in bytes. */
+  quota?: number;
+  quotaUsed?: number;
+  periodStart?: number;
   monthUp?: number;
   monthDown?: number;
   expiry?: string;
@@ -1383,6 +1398,8 @@ export interface PublicStatus {
   generatedAt: number;
   days: string[];
   showTraffic: boolean;
+  /** How the page groups servers: the admin's groups or regions. */
+  groupBy?: "group" | "region";
   nodes: PublicStatusNode[];
   totals: {
     nodes: number;

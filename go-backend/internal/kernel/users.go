@@ -1,6 +1,9 @@
 package kernel
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
 	"fmt"
 	"sort"
 )
@@ -27,15 +30,33 @@ func xrayUserMatch(id int64) []string {
 	return []string{u.Email(), u.Name()}
 }
 
+func (in Inbound) validateSSSubscriptionUsers(kernelType string) error {
+	if !in.Settings.SSSubscriptionUsers {
+		return nil
+	}
+	if kernelType != TypeXray || in.Protocol != ProtocolShadowsocks {
+		return fmt.Errorf("SS 订阅独立密码目前仅支持 Xray 的 Shadowsocks 入站")
+	}
+	switch in.Settings.Method {
+	case "aes-128-gcm", "aes-256-gcm", "chacha20-ietf-poly1305",
+		"2022-blake3-aes-128-gcm", "2022-blake3-aes-256-gcm":
+	default:
+		return fmt.Errorf("SS 订阅独立密码仅支持传统 AES-GCM、ChaCha20-Poly1305 和 SS2022 AES-GCM")
+	}
+	if len(in.Extra) != 0 {
+		return fmt.Errorf("SS 订阅独立密码不能与高级 JSON 配置同时使用")
+	}
+	return nil
+}
+
 // SupportsUsers reports whether the inbound can carry per-user credentials.
-// Snell has a single PSK. Shadowsocks stays shared too: 2022 multi-user
-// mode would require every client, the owner's included, to send a user
-// identity, breaking existing links.
 func (in Inbound) SupportsUsers() bool {
 	switch in.Protocol {
 	case ProtocolVLESS, ProtocolVMess, ProtocolTrojan, ProtocolHysteria2, ProtocolTUIC, ProtocolAnyTLS, ProtocolNaive,
 		ProtocolSOCKS, ProtocolHTTP:
 		return true
+	case ProtocolShadowsocks:
+		return in.Settings.SSSubscriptionUsers
 	}
 	return false
 }
@@ -58,10 +79,32 @@ func (in Inbound) ForUser(u User) Inbound {
 	case ProtocolNaive, ProtocolSOCKS, ProtocolHTTP:
 		out.Settings.Username = u.Name()
 		out.Settings.Password = u.Password
+	case ProtocolShadowsocks:
+		out.Settings.Password = ""
+		if u.canMeterSS() {
+			password := in.ssSubscriptionPassword(u)
+			if SS2022KeyLen(in.Settings.Method) == 0 {
+				out.Settings.Password = password
+			} else if in.Settings.Password != "" {
+				out.Settings.Password = in.Settings.Password + ":" + password
+			}
+		}
 	default:
 		out.Settings.Password = u.Password
 	}
 	return out
+}
+
+func (u User) canMeterSS() bool { return UserMark(u.ID) != 0 && u.Password != "" }
+
+func (in Inbound) ssSubscriptionPassword(user User) string {
+	length := SS2022KeyLen(in.Settings.Method)
+	if length == 0 {
+		return user.Password
+	}
+	mac := hmac.New(sha256.New, []byte(user.Password))
+	fmt.Fprintf(mac, "flyx:ss2022:%s:%d:%d", in.Settings.Method, in.ID, user.ID)
+	return base64.StdEncoding.EncodeToString(mac.Sum(nil)[:length])
 }
 
 // xrayUserClients returns the extra Xray clients for the inbound's users.
@@ -82,6 +125,11 @@ func xrayUserClients(in Inbound) []interface{} {
 			c = obj{"id": u.UUID}
 		case ProtocolTrojan:
 			c = obj{"password": u.Password}
+		case ProtocolShadowsocks:
+			c = obj{"password": in.ssSubscriptionPassword(u)}
+			if SS2022KeyLen(in.Settings.Method) == 0 {
+				c["method"] = in.Settings.Method
+			}
 		case ProtocolSOCKS, ProtocolHTTP:
 			// Xray reports the username as the user's email.
 			out = append(out, obj{"user": u.Name(), "pass": u.Password})

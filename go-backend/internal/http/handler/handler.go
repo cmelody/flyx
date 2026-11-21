@@ -156,7 +156,6 @@ func New(repo *repo.Repository, jwtSecret string) *Handler {
 		statusThemes:             &statustheme.Store{},
 		regionNudge:              make(chan struct{}, 1),
 	}
-	h.installGithubTokenSource()
 	h.healthCheck = health.NewChecker(repo, h.wsServer)
 	h.qualityProber = newTunnelQualityProber(h)
 	h.wsServer.SetNodeOnlineHook(h.onNodeOnline)
@@ -249,8 +248,6 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/backup/export", h.backupExport)
 	mux.HandleFunc("/api/v1/backup/import", h.backupImport)
 	mux.HandleFunc("/api/v1/backup/restore", h.backupImport)
-	mux.HandleFunc("/api/v1/config/github-token/status", h.githubTokenStatus)
-	mux.HandleFunc("/api/v1/config/github-token/save", h.githubTokenSave)
 	mux.HandleFunc("/api/v1/backup/gist/status", h.gistBackupStatus)
 	mux.HandleFunc("/api/v1/backup/gist/save", h.gistBackupSave)
 	mux.HandleFunc("/api/v1/backup/gist/upload", h.gistBackupUpload)
@@ -301,6 +298,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/subscription/list", h.subscriptionList)
 	mux.HandleFunc("/api/v1/subscription/save", h.subscriptionSave)
 	mux.HandleFunc("/api/v1/subscription/delete", h.subscriptionDelete)
+	mux.HandleFunc("/api/v1/subscription/order", h.subscriptionOrder)
 	mux.HandleFunc("/api/v1/subscription/reset", h.subscriptionReset)
 	mux.HandleFunc("/api/v1/subscription/reset-traffic", h.subscriptionResetTraffic)
 	mux.HandleFunc("/api/v1/subscription/traffic", h.subscriptionTraffic)
@@ -388,6 +386,7 @@ func (h *Handler) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/api/v1/federation/node/import", h.nodeImport)
 
 	mux.HandleFunc("/api/v1/node/traffic/month", h.nodeTrafficMonth)
+	mux.HandleFunc("/api/v1/node/billing", h.nodeBilling)
 	mux.HandleFunc("/api/v1/monitor/nodes/", h.monitorNodeMetricsHandler)
 	mux.HandleFunc("/api/v1/monitor/nodes", h.monitorNodeListHandler)
 	mux.HandleFunc("/api/v1/monitor/tunnels", h.monitorTunnelListHandler)
@@ -594,8 +593,11 @@ func (h *Handler) nodeList(w http.ResponseWriter, r *http.Request) {
 	}
 
 	h.syncRemoteNodeStatuses(items)
+	hiddenCfg, _ := h.repo.GetConfigsByNames([]string{statusPageHiddenNodesKey})
+	hidden := parseStatusHiddenNodes(hiddenCfg[statusPageHiddenNodesKey])
 	for _, item := range items {
 		id := asInt64(item["id"], 0)
+		item["statusVisible"] = !hidden[id]
 		item["notifyEvents"] = parseNodeNotifyEvents(asString(item["notifyEvents"]))
 		if c := parseNodeTargetChoice(asString(item["latencyTargets"])); c != nil {
 			item["latencyTargets"] = c

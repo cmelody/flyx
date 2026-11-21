@@ -122,9 +122,14 @@ type inboundView struct {
 	OutboundName    string `json:"outboundName,omitempty"`
 	OutboundMissing bool   `json:"outboundMissing,omitempty"`
 	// SplitRules are the inbound's 分流 rules.
-	SplitRules         []kernel.SplitRule `json:"splitRules"`
-	OutboundIPStrategy string             `json:"outboundIpStrategy"`
-	Tags               []string           `json:"tags"`
+	SplitRules []kernel.SplitRule `json:"splitRules"`
+	// DefaultBlock: what no 分流 rule matched is dropped.
+	DefaultBlock bool `json:"defaultBlock"`
+	// RateUpMbps / RateDownMbps: the inbound's speed limits, 0 = none.
+	RateUpMbps         int      `json:"rateUpMbps"`
+	RateDownMbps       int      `json:"rateDownMbps"`
+	OutboundIPStrategy string   `json:"outboundIpStrategy"`
+	Tags               []string `json:"tags"`
 }
 
 // kernelSecurityView hides the self-signed private material and DNS API
@@ -160,7 +165,11 @@ type inboundRequest struct {
 	WhitelistExtra      string             `json:"whitelistExtra"`
 	OutboundID          int64              `json:"outboundId"`
 	SplitRules          []kernel.SplitRule `json:"splitRules"`
-	Enabled             *bool              `json:"enabled"`
+	// DefaultBlock, RateUpMbps, RateDownMbps: absent keeps the stored value.
+	DefaultBlock *bool `json:"defaultBlock"`
+	RateUpMbps   *int  `json:"rateUpMbps"`
+	RateDownMbps *int  `json:"rateDownMbps"`
+	Enabled      *bool `json:"enabled"`
 }
 
 // ---- conversion ----
@@ -596,6 +605,9 @@ func (h *Handler) inboundList(w http.ResponseWriter, r *http.Request) {
 			SourceName:         sourceNames[row.SourceID],
 			OutboundID:         row.OutboundID,
 			SplitRules:         rowSplitRules(row),
+			DefaultBlock:       row.DefaultBlock == 1,
+			RateUpMbps:         row.RateUpMbps,
+			RateDownMbps:       row.RateDownMbps,
 			OutboundIPStrategy: row.OutboundIPStrategy,
 			Tags:               splitTags(row.Tags),
 		}
@@ -672,6 +684,21 @@ func (h *Handler) inboundSave(w http.ResponseWriter, r *http.Request, update boo
 		}
 		// Keep secrets the client did not resend (the list hides PEM).
 		old, _ := inboundFromModel(row)
+		if old.Protocol == kernel.ProtocolShadowsocks && kernel.SS2022KeyLen(old.Settings.Method) > 0 {
+			method := strings.TrimSpace(req.Settings.Method)
+			if method == "" {
+				method = kernel.DefaultSSMethod
+			}
+			wasMetered := old.Settings.SSSubscriptionUsers
+			isMetered := req.Settings.SSSubscriptionUsers && kernel.SS2022KeyLen(method) > 0 &&
+				strings.EqualFold(strings.TrimSpace(req.Protocol), kernel.ProtocolShadowsocks)
+			switch {
+			case wasMetered && isMetered && method == old.Settings.Method && strings.TrimSpace(req.Settings.Password) == "":
+				req.Settings.Password = old.Settings.Password
+			case wasMetered != isMetered && strings.TrimSpace(req.Settings.Password) == old.Settings.Password:
+				req.Settings.Password = ""
+			}
+		}
 		if req.Security.Type == old.Security.Type && req.Security.CertMode == old.Security.CertMode &&
 			req.Security.CertPEM == "" && req.Security.KeyPEM == "" {
 			req.Security.CertPEM, req.Security.KeyPEM = old.Security.CertPEM, old.Security.KeyPEM
@@ -723,6 +750,20 @@ func (h *Handler) inboundSave(w http.ResponseWriter, r *http.Request, update boo
 		response.WriteJSON(w, response.ErrDefault("该服务器无法使用入站白名单："+node.NftError))
 		return
 	}
+	if req.RateUpMbps != nil || req.RateDownMbps != nil {
+		up, down := row.RateUpMbps, row.RateDownMbps
+		if req.RateUpMbps != nil {
+			up = *req.RateUpMbps
+		}
+		if req.RateDownMbps != nil {
+			down = *req.RateDownMbps
+		}
+		if err := validateInboundRates(node, up, down); err != nil {
+			response.WriteJSON(w, response.ErrDefault(err.Error()))
+			return
+		}
+		row.RateUpMbps, row.RateDownMbps = up, down
+	}
 	row.ShareAddressMode = mode
 	if mode != "custom" {
 		req.ShareHost = ""
@@ -765,13 +806,25 @@ func (h *Handler) inboundSave(w http.ResponseWriter, r *http.Request, update boo
 		response.WriteJSON(w, response.ErrDefault(err.Error()))
 		return
 	}
+	if in.Settings.SSSubscriptionUsers {
+		if strings.TrimSpace(node.NftError) != "" {
+			response.WriteJSON(w, response.ErrDefault("SS 订阅独立密码需要服务器支持流量计数："+node.NftError))
+			return
+		}
+		if update {
+			if msg := h.chainInUseMessage(&row); msg != "" {
+				response.WriteJSON(w, response.ErrDefault(msg))
+				return
+			}
+		}
+	}
 	if in.Security.CertMode == kernel.CertModeACME && versionBelow(k.Version, 1, 14) {
 		response.WriteJSON(w, response.ErrDefault(fmt.Sprintf("自动申请证书需要 sing-box 1.14 及以上，服务器安装的是 %s", k.Version)))
 		return
 	}
 	row.OutboundIPStrategy = in.OutboundIPStrategy
 	prevTargets := outboundTargets(row)
-	if err := h.setInboundRouting(&row, k.KernelType, k.Version, req.OutboundID, req.SplitRules); err != nil {
+	if err := h.setInboundRouting(&row, k.KernelType, k.Version, req.OutboundID, req.SplitRules, req.DefaultBlock); err != nil {
 		response.WriteJSON(w, response.ErrDefault(err.Error()))
 		return
 	}
@@ -1256,6 +1309,7 @@ func (h *Handler) buildKernelApplyPayloadWith(k *model.NodeKernel, realmOverride
 	inbounds := make([]kernel.Inbound, 0, len(rows))
 	ports := make([]map[string]interface{}, 0, len(rows))
 	users := h.activeUsersByInbound(time.Now())
+	node, _ := h.repo.GetNodeByID(k.NodeID)
 	for _, row := range rows {
 		if row.Enabled != 1 {
 			continue
@@ -1267,7 +1321,7 @@ func (h *Handler) buildKernelApplyPayloadWith(k *model.NodeKernel, realmOverride
 		if err != nil {
 			return nil, "", err
 		}
-		if in.SupportsUsers() {
+		if in.SupportsUsers() && !(in.Settings.SSSubscriptionUsers && node != nil && strings.TrimSpace(node.NftError) != "") {
 			in.Users = users[in.ID]
 		}
 		if in.Via, err = h.inboundVia(row); err != nil {
@@ -1284,13 +1338,20 @@ func (h *Handler) buildKernelApplyPayloadWith(k *model.NodeKernel, realmOverride
 		if row.RelayWhitelist == 1 {
 			port["allow"] = h.inboundAllowList(row)
 		}
+		// Speed limits, enforced by the agent on the port (agent 3.9.4+;
+		// older agents ignore them, which saving warns about).
+		if row.RateUpMbps > 0 {
+			port["limitUpMbps"] = row.RateUpMbps
+		}
+		if row.RateDownMbps > 0 {
+			port["limitDownMbps"] = row.RateDownMbps
+		}
 		ports = append(ports, port)
 	}
 	proxy := ""
 	if enabled, proxyURL := h.getGithubProxyConfig(); enabled {
 		proxy = proxyURL
 	}
-	node, _ := h.repo.GetNodeByID(k.NodeID)
 	rendered, err := kernel.RenderWith(k.KernelType, inbounds, kernel.RenderOptions{
 		RuleSetMirror:      proxy,
 		SingboxHTTPClient:  kernelCaps(k.Version).SingboxHTTPClient,

@@ -97,6 +97,12 @@ func xraySettings(in Inbound) (obj, error) {
 	case ProtocolTrojan:
 		return obj{"clients": append([]interface{}{obj{"password": s.Password}}, xrayUserClients(in)...)}, nil
 	case ProtocolShadowsocks:
+		if s.SSSubscriptionUsers {
+			if SS2022KeyLen(s.Method) > 0 {
+				return obj{"method": s.Method, "password": s.Password, "clients": xrayUserClients(in), "network": "tcp,udp"}, nil
+			}
+			return obj{"users": xrayUserClients(in), "network": "tcp,udp"}, nil
+		}
 		return obj{"method": s.Method, "password": s.Password, "network": "tcp,udp"}, nil
 	case ProtocolSOCKS:
 		accounts := append([]interface{}{obj{"user": s.Username, "pass": s.Password}}, xrayUserClients(in)...)

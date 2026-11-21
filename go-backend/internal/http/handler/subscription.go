@@ -38,6 +38,7 @@ type subPipeline struct {
 	Prefix       string   `json:"prefix"`
 	Dedupe       bool     `json:"dedupe"`
 	Sort         string   `json:"sort"`
+	NodeOrder    []string `json:"nodeOrder,omitempty"`
 	RegionGroups bool     `json:"regionGroups"`
 	ChainLanding string   `json:"chainLanding"`
 	ChainRelay   string   `json:"chainRelay"`
@@ -74,6 +75,7 @@ type subPipeline struct {
 // here (Lines ... Script) are what older versions stored and are ignored.
 func (p subPipeline) options() kernel.SubOptions {
 	return kernel.SubOptions{
+		NodeOrder:    p.NodeOrder,
 		RegionGroups: p.RegionGroups, ChainLanding: p.ChainLanding, ChainRelay: p.ChainRelay,
 		Rules: p.Rules, RuleGroups: p.RuleGroups,
 		ChainLandingNames: p.ChainLandingNames, ChainRelayNames: p.ChainRelayNames,
@@ -87,6 +89,21 @@ func (p *subPipeline) normalize() error {
 	// Node processing is the node groups' (see groupPipeline).
 	p.Lines, p.Include, p.Exclude, p.Rename, p.Prefix, p.Sort, p.Script = "", "", "", "", "", "", ""
 	p.Regions, p.Protocols, p.AddFlag, p.Dedupe = []string{}, []string{}, false, false
+	if len(p.NodeOrder) > 10000 {
+		return errText("手动排序的节点过多")
+	}
+	seenOrderKeys := make(map[string]bool, len(p.NodeOrder))
+	ordered := p.NodeOrder[:0]
+	for _, key := range p.NodeOrder {
+		if len(key) > 512 {
+			return errText("节点排序标识无效")
+		}
+		if key != "" && !seenOrderKeys[key] {
+			seenOrderKeys[key] = true
+			ordered = append(ordered, key)
+		}
+	}
+	p.NodeOrder = ordered
 	p.ChainLanding = strings.TrimSpace(p.ChainLanding)
 	p.ChainRelay = strings.TrimSpace(p.ChainRelay)
 	if len(p.ChainLanding) > 1000 || len(p.ChainRelay) > 1000 {
@@ -632,6 +649,10 @@ func (h *Handler) subscriptionSave(w http.ResponseWriter, r *http.Request) {
 		}
 	} else {
 		s = &model.Subscription{Token: randomHex(16), Enabled: 1, CreatedTime: now.UnixMilli(), TrafficSince: now.UnixMilli()}
+		if s.Inx, err = h.repo.NextSubscriptionInx(); err != nil {
+			response.WriteJSON(w, response.Err(-2, err.Error()))
+			return
+		}
 	}
 	s.Name = req.Name
 	s.Kind = req.Kind
@@ -770,6 +791,7 @@ func (h *Handler) subscriptionResetTraffic(w http.ResponseWriter, r *http.Reques
 }
 
 type subPreviewItem struct {
+	OrderKey string `json:"orderKey,omitempty"`
 	Name     string `json:"name"`
 	Original string `json:"original"`
 	Region   string `json:"region"`
@@ -909,4 +931,24 @@ func (h *Handler) inboundSubInfo(w http.ResponseWriter, r *http.Request) {
 		"token": s.Token,
 		"path":  "/api/v1/open_api/sub/" + s.Token,
 	}))
+}
+
+// subscriptionOrder sets the order the subscriptions are listed in.
+func (h *Handler) subscriptionOrder(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		response.WriteJSON(w, response.ErrDefault("请求失败"))
+		return
+	}
+	var req struct {
+		IDs []int64 `json:"ids"`
+	}
+	if err := decodeJSON(r.Body, &req); err != nil {
+		response.WriteJSON(w, response.ErrDefault("请求参数错误"))
+		return
+	}
+	if err := h.repo.UpdateSubscriptionOrder(req.IDs); err != nil {
+		response.WriteJSON(w, response.Err(-2, err.Error()))
+		return
+	}
+	response.WriteJSON(w, response.OKEmpty())
 }

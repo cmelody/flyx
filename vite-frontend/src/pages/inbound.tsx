@@ -80,8 +80,7 @@ import { Switch } from "@/shadcn-bridge/heroui/switch";
 import { formatTraffic } from "@/utils/traffic";
 import { latestProbe } from "@/utils/latest-probe";
 
-const modalBase =
-  "!w-[calc(100%-32px)] !mx-auto sm:!w-full overflow-hidden";
+const modalBase = "!w-[calc(100%-32px)] !mx-auto sm:!w-full overflow-hidden";
 
 type ConfirmAction = "delete" | "regenerate" | "reset";
 
@@ -737,11 +736,28 @@ export default function InboundPage() {
         {item.splitRules?.length > 0 && (
           <Chip
             className="shrink-0 whitespace-nowrap"
-            color="primary"
+            color={item.defaultBlock ? "danger" : "primary"}
             size="sm"
+            title={
+              item.defaultBlock
+                ? "只放行分流规则选中的流量，其他的丢弃"
+                : undefined
+            }
             variant="flat"
           >
-            分流
+            {item.defaultBlock ? "仅分流放行" : "分流"}
+          </Chip>
+        )}
+        {Boolean(item.rateDownMbps || item.rateUpMbps) && (
+          <Chip
+            className="shrink-0 whitespace-nowrap"
+            size="sm"
+            title="节点总带宽限速"
+            variant="flat"
+          >
+            限速
+            {item.rateDownMbps ? ` ↓${item.rateDownMbps}M` : ""}
+            {item.rateUpMbps ? ` ↑${item.rateUpMbps}M` : ""}
           </Chip>
         )}
         {item.relayOnly && (
@@ -761,9 +777,10 @@ export default function InboundPage() {
       <div
         key={item.id}
         aria-pressed={selectMode ? selected : undefined}
-        className={`group flex w-full cursor-pointer items-center gap-3 border-b border-divider px-2 py-3 text-left transition-colors ${
+        className={`list-row group flex w-full cursor-pointer items-center gap-3 border-b border-divider px-2 py-3 text-left transition-colors ${
           selected ? "bg-default-100" : "hover:bg-default-50"
         }`}
+        data-selected={selected ? "true" : undefined}
         role="button"
         tabIndex={0}
         onClick={activate}
@@ -874,6 +891,7 @@ export default function InboundPage() {
 
       {tab === "sources" && (
         <RemoteSourcesSection
+          inbounds={inbounds}
           sources={sources}
           onChanged={() => loadData(false)}
         />
@@ -954,7 +972,7 @@ export default function InboundPage() {
           )}
 
           {selectMode && (
-            <div className="sticky top-0 z-10 mb-2 flex flex-wrap items-center gap-2 border-b border-divider bg-background py-2">
+            <div className="phone-sticky-bar sticky top-0 z-10 mb-2 flex flex-wrap items-center gap-2 border-b border-divider bg-background py-2">
               <span className="text-sm text-default-600">
                 已选 {selectedIds.size} 个
               </span>
@@ -1032,7 +1050,7 @@ export default function InboundPage() {
                 </h3>
                 <p className="text-default-500 text-sm max-w-sm">
                   {kernels.length === 0 && inbounds.length === 0
-                    ? "先在服务器上安装内核，然后在这里创建 VLESS-Reality、SS2022 等入站；也可以点“导入”，导入别处搭好的 ss 节点用来对接中转。"
+                    ? "先在服务器上安装内核，然后在这里创建 VLESS-Reality、Shadowsocks 等入站；也可以点“导入”，导入别处搭好的 ss 节点用来对接中转。"
                     : inbounds.length === 0
                       ? "点击“新建入站”，选择一个模板即可快速创建。"
                       : "换个关键词、服务器或标签试试。"}

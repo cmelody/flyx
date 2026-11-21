@@ -51,7 +51,8 @@ type NodeInbound struct {
 	UpdatedTime    int64  `gorm:"column:updated_time;not null"`
 	// SourceID is the remote subscription an imported node came from (0 =
 	// imported by hand); the source's refresh keeps it up to date.
-	SourceID int64 `gorm:"column:source_id;not null;default:0;index"`
+	SourceID    int64 `gorm:"column:source_id;not null;default:0;index"`
+	SourceOrder int   `gorm:"column:source_order;not null;default:0"`
 	// ImportedName is the node's name in its source at the last refresh; a
 	// Name that differs from it was set by the user and survives refreshes.
 	ImportedName string `gorm:"column:imported_name;type:varchar(100);not null;default:''"`
@@ -60,7 +61,16 @@ type NodeInbound struct {
 	// direct.
 	OutboundID int64 `gorm:"column:outbound_id;not null;default:0;index"`
 	// SplitRules are the 分流 rules (JSON list of kernel.SplitRule).
-	SplitRules         string `gorm:"column:split_rules;type:text;not null;default:''"`
+	SplitRules string `gorm:"column:split_rules;type:text;not null;default:''"`
+	// DefaultBlock drops what no 分流 rule matched instead of sending it
+	// out directly (OutboundID is then 0): a node that only reaches some
+	// sites.
+	DefaultBlock int `gorm:"column:default_block;not null;default:0"`
+	// RateUpMbps / RateDownMbps cap the inbound's total upload (client to
+	// server) and download in Mbit/s, shared by everyone on it; 0 = no cap.
+	// The agent enforces them with nftables on the inbound's port.
+	RateUpMbps         int    `gorm:"column:rate_up_mbps;not null;default:0"`
+	RateDownMbps       int    `gorm:"column:rate_down_mbps;not null;default:0"`
 	OutboundIPStrategy string `gorm:"column:outbound_ip_strategy;type:varchar(20);not null;default:'auto'"`
 	// Tags are the user's labels (comma-separated), for telling nodes apart
 	// in the list; they do not affect rendering or subscriptions.
@@ -68,6 +78,9 @@ type NodeInbound struct {
 }
 
 func (NodeInbound) TableName() string { return "node_inbound" }
+
+// MaxInboundRateMbps is the largest speed limit an inbound takes (100 Gbit/s).
+const MaxInboundRateMbps = 100000
 
 // RemoteSource is a subscription URL (an airport, a friend's panel) whose
 // nodes are kept as imported nodes and refreshed periodically.

@@ -29,6 +29,10 @@ func (h *Handler) nodeCreate(w http.ResponseWriter, r *http.Request) {
 		response.WriteJSON(w, response.ErrDefault(err.Error()))
 		return
 	}
+	if _, err := nodeProfileUpdates(req); err != nil {
+		response.WriteJSON(w, response.ErrDefault(err.Error()))
+		return
+	}
 	name := asString(req["name"])
 	serverIP := asString(req["serverIp"])
 	if name == "" || serverIP == "" {
@@ -91,6 +95,10 @@ func (h *Handler) nodeCreate(w http.ResponseWriter, r *http.Request) {
 		response.WriteJSON(w, response.Err(-2, err.Error()))
 		return
 	}
+	if err := h.applyNodeProfileRequest(nodeID, req); err != nil {
+		response.WriteJSON(w, response.Err(-2, err.Error()))
+		return
+	}
 	h.nudgeNodeRegions()
 	response.WriteJSON(w, response.OKEmpty())
 }
@@ -117,6 +125,10 @@ func (h *Handler) nodeUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	notifyEvents, err := nodeNotifyEventsFromRequest(req)
 	if err != nil {
+		response.WriteJSON(w, response.ErrDefault(err.Error()))
+		return
+	}
+	if _, err := nodeProfileUpdates(req); err != nil {
 		response.WriteJSON(w, response.ErrDefault(err.Error()))
 		return
 	}
@@ -190,6 +202,10 @@ func (h *Handler) nodeUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := h.applyNodeRegionRequest(id, req); err != nil {
 		response.WriteJSON(w, response.Err(-2, err.Error()))
+		return
+	}
+	if err := h.applyNodeProfileRequest(id, req); err != nil {
+		response.WriteJSON(w, response.ErrDefault(err.Error()))
 		return
 	}
 	h.nudgeNodeRegions()
@@ -370,13 +386,6 @@ func (h *Handler) nodeInstall(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	channel := normalizeReleaseChannel(req.Channel)
-	version, err := resolveLatestReleaseByChannel(channel)
-	if err != nil {
-		response.WriteJSON(w, response.Err(-2, fmt.Sprintf("获取最新%s失败: %v", releaseChannelLabel(channel), err)))
-		return
-	}
-
 	secret, err := h.repo.GetNodeSecret(req.ID)
 	if err != nil {
 		response.WriteJSON(w, response.ErrDefault("服务器不存在"))
@@ -385,16 +394,27 @@ func (h *Handler) nodeInstall(w http.ResponseWriter, r *http.Request) {
 	panelAddr, err := h.repo.GetViteConfigValue("ip")
 	if err != nil {
 		if err == sql.ErrNoRows {
-			response.WriteJSON(w, response.ErrDefault("请先前往网站配置中设置ip"))
+			response.WriteJSON(w, response.ErrDefault("请先在设置 → 基本中填写并保存面板后端地址（IP:端口或域名:端口），再生成安装命令"))
 			return
 		}
 		response.WriteJSON(w, response.Err(-2, err.Error()))
 		return
 	}
+	address := processServerAddress(panelAddr)
+	if address == "" {
+		response.WriteJSON(w, response.ErrDefault("请先在设置 → 基本中填写并保存面板后端地址（IP:端口或域名:端口），再生成安装命令"))
+		return
+	}
+
+	channel := normalizeReleaseChannel(req.Channel)
+	version, err := resolveLatestReleaseByChannel(channel)
+	if err != nil {
+		response.WriteJSON(w, response.Err(-2, fmt.Sprintf("获取最新%s失败: %v", releaseChannelLabel(channel), err)))
+		return
+	}
 	enabled, proxyURL := h.getGithubProxyConfig()
 
 	var cmd string
-	address := processServerAddress(panelAddr)
 	if enabled {
 		cmd = fmt.Sprintf("curl -L %s/https://github.com/%s/releases/download/%s/install.sh -o ./install.sh && chmod +x ./install.sh && PROXY_ENABLED=true PROXY_URL=%s VERSION=%s ./install.sh -a %s -s %s",
 			proxyURL, githubRepo, version, proxyURL, version, address, secret)
@@ -710,13 +730,10 @@ func (h *Handler) uninstallNodeAgent(node *model.Node) nodeDeleteResult {
 	return result
 }
 
+// normalizeNodeRenewalCycle accepts "month", "quarter", "year" and "<n>m" /
+// "<n>y"; "" for anything else (no cycle).
 func normalizeNodeRenewalCycle(v string) string {
-	switch strings.ToLower(strings.TrimSpace(v)) {
-	case "month", "quarter", "year":
-		return strings.ToLower(strings.TrimSpace(v))
-	default:
-		return ""
-	}
+	return model.CanonicalRenewalCycle(model.RenewalCycleMonths(strings.ToLower(strings.TrimSpace(v))))
 }
 
 func defaultNodeForwardMode(mode string) string {

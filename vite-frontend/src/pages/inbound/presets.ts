@@ -86,6 +86,7 @@ export interface InboundForm {
   flowVision: boolean;
   password: string;
   method: string;
+  ssSubscriptionUsers: boolean;
   snellVersion: string;
   snellMode: string;
   masquerade: string;
@@ -129,6 +130,9 @@ export interface InboundForm {
   acceptProxyProtocol: boolean;
   relayWhitelist: boolean;
   whitelistExtra: string;
+  /** Speed limits in Mbit/s as typed; "" is no limit. */
+  rateUpMbps: string;
+  rateDownMbps: string;
   /** Chained outbound inbound id; "" leaves directly. */
   outboundId: string;
   outboundIpStrategy:
@@ -186,8 +190,8 @@ export const PRESETS: Preset[] = [
   },
   {
     key: "ss2022",
-    label: "Shadowsocks 2022",
-    description: "轻量，客户端支持广泛",
+    label: "Shadowsocks",
+    description: "轻量，客户端支持广泛，加密方式可选",
     protocol: "shadowsocks",
     transport: "tcp",
     security: "none",
@@ -239,7 +243,7 @@ export const PRESETS: Preset[] = [
   },
   {
     key: "ss2022-shadowtls",
-    label: "SS2022 + ShadowTLS",
+    label: "Shadowsocks + ShadowTLS",
     description: "握手伪装成访问真实网站（仅 TCP）",
     kernel: "singbox",
     protocol: "shadowsocks",
@@ -332,6 +336,7 @@ export function emptyForm(
     flowVision: true,
     password: "",
     method: caps?.defaults.ssMethod ?? "2022-blake3-aes-128-gcm",
+    ssSubscriptionUsers: false,
     snellVersion: "",
     snellMode: "",
     masquerade: "",
@@ -374,6 +379,8 @@ export function emptyForm(
     acceptProxyProtocol: false,
     relayWhitelist: false,
     whitelistExtra: "",
+    rateUpMbps: "",
+    rateDownMbps: "",
     outboundId: "",
     outboundIpStrategy: "auto",
     splitRules: [],
@@ -412,6 +419,8 @@ export function applyPreset(
   return {
     ...form,
     protocol: preset.protocol,
+    ssSubscriptionUsers:
+      preset.protocol === "shadowsocks" && form.ssSubscriptionUsers,
     transportType: preset.transport,
     securityType: preset.security,
     flowVision: Boolean(preset.vision),
@@ -436,6 +445,7 @@ export function formFromItem(item: InboundApiItem): InboundForm {
     flowVision: Boolean(item.settings.flow),
     password: item.settings.password ?? "",
     method: item.settings.method ?? "",
+    ssSubscriptionUsers: Boolean(item.settings.ssSubscriptionUsers),
     snellVersion: item.settings.snellVersion
       ? String(item.settings.snellVersion)
       : "",
@@ -481,6 +491,8 @@ export function formFromItem(item: InboundApiItem): InboundForm {
     acceptProxyProtocol: item.acceptProxyProtocol,
     relayWhitelist: item.relayWhitelist,
     whitelistExtra: item.whitelistExtra,
+    rateUpMbps: item.rateUpMbps ? String(item.rateUpMbps) : "",
+    rateDownMbps: item.rateDownMbps ? String(item.rateDownMbps) : "",
     outboundId: item.outboundId ? String(item.outboundId) : "",
     outboundIpStrategy: item.outboundIpStrategy || "auto",
     splitRules: splitFormFromItem(item),
@@ -550,9 +562,26 @@ export function vlessEncAllowed(form: InboundForm): boolean {
   return form.protocol === "vless" && form.kernelType === "xray";
 }
 
+export function ssSubscriptionUsersAllowed(form: InboundForm): boolean {
+  return (
+    form.kernelType === "xray" &&
+    form.protocol === "shadowsocks" &&
+    [
+      "aes-128-gcm",
+      "aes-256-gcm",
+      "chacha20-ietf-poly1305",
+      "2022-blake3-aes-128-gcm",
+      "2022-blake3-aes-256-gcm",
+    ].includes(form.method)
+  );
+}
+
 export function toPayload(form: InboundForm): InboundMutationPayload {
   const usesUUID = uuidProtocols.includes(form.protocol);
-  const usesPassword = passwordProtocols.includes(form.protocol);
+  const ssSubscriptionUsers =
+    ssSubscriptionUsersAllowed(form) && form.ssSubscriptionUsers;
+  const usesPassword =
+    passwordProtocols.includes(form.protocol) && !ssSubscriptionUsers;
 
   return {
     id: form.id,
@@ -568,6 +597,7 @@ export function toPayload(form: InboundForm): InboundMutationPayload {
         visionAllowed(form) && form.flowVision ? "xtls-rprx-vision" : undefined,
       password: usesPassword ? form.password.trim() : undefined,
       method: form.protocol === "shadowsocks" ? form.method : undefined,
+      ssSubscriptionUsers: ssSubscriptionUsers || undefined,
       snellVersion:
         form.protocol === "snell" && form.snellVersion
           ? Number(form.snellVersion)
@@ -653,6 +683,8 @@ export function toPayload(form: InboundForm): InboundMutationPayload {
     acceptProxyProtocol: form.acceptProxyProtocol,
     relayWhitelist: form.relayWhitelist,
     whitelistExtra: form.relayWhitelist ? form.whitelistExtra.trim() : "",
+    rateUpMbps: rateMbps(form.rateUpMbps),
+    rateDownMbps: rateMbps(form.rateDownMbps),
     outboundId: Number(form.outboundId) || 0,
     outboundIpStrategy: form.outboundIpStrategy,
     splitRules: splitPayload(form.splitRules),
@@ -709,4 +741,11 @@ export function describeInbound(item: InboundApiItem): string {
   }
 
   return parts.join(" + ");
+}
+
+/** A typed speed limit as whole Mbit/s; blank or invalid is 0 (no limit). */
+export function rateMbps(v: string): number {
+  const n = Math.round(Number(v.trim()));
+
+  return Number.isFinite(n) && n > 0 ? n : 0;
 }
